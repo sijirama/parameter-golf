@@ -1,6 +1,6 @@
 numpy
 tqdm
-torch==2.10
+# torch (moved to setup script for CPU-only control)
 huggingface-hub
 kernels
 setuptools
