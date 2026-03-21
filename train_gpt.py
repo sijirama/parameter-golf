@@ -55,7 +55,7 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -88,6 +88,7 @@ class Hyperparameters:
     # new 
     num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 4))
     num_recurrent_passes = int(os.environ.get("NUM_RECURRENT_PASSES", 2))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -112,10 +113,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     return X.T if transposed else X
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay:float=0.0):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -165,6 +166,8 @@ class Muon(torch.optim.Optimizer):
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
+                if group.get("weight_decay", 0.0) > 0:
+                    p.mul_(1.0 - lr * group["weight_decay"])
                 curr += p.numel()
 
         return loss
@@ -227,42 +230,58 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
-        )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
+    window_size = args.train_seq_len        # 2048 — full window
+    stride = window_size // 2              # 1024 — step size
+    context_len = stride                   # first half = warmup only
+
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
+    # how many windows fit in the validation set
+    total_tokens = val_tokens.numel() - 1
+    total_windows = max(0, (total_tokens - window_size) // stride + 1)
+
+    # split windows across ranks
+    win_start = (total_windows * rank) // world_size
+    win_end = (total_windows * (rank + 1)) // world_size
+
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+        for w in range(win_start, win_end):
+            tok_start = w * stride
+            tok_end = tok_start + window_size + 1
+
+            local = val_tokens[tok_start:tok_end].to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
+
+            x = local[:-1].unsqueeze(0)  # [1, window_size]
+            y = local[1:].unsqueeze(0)   # [1, window_size]
+
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                               enabled=(device.type == "cuda")):
+                logits = model(x)  # [1, window_size, vocab_size] — no target = returns logits
+
+            # only score the second half — context_len onwards
+            scored_logits = logits[0, context_len:, :]        # [stride, vocab]
+            scored_y = y[0, context_len:]                     # [stride]
+            scored_prev = x[0, context_len - 1:window_size - 1]  # preceding tokens for BPB
+
+            token_loss = F.cross_entropy(
+                scored_logits.float(),
+                scored_y,
+                reduction="sum"
+            )
+
+            val_loss_sum += token_loss.to(torch.float64)
+            val_token_count += float(scored_y.numel())
+
+            token_bytes = base_bytes_lut[scored_y].to(dtype=torch.int16)
+            token_bytes += (
+                has_leading_space_lut[scored_y] &
+                ~is_boundary_token_lut[scored_prev]
+            ).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
 
     if dist.is_available() and dist.is_initialized():
@@ -682,31 +701,36 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor|None=None) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
-        # encoder pass — forward through unique blocks, save skips
         for i in range(self.num_unique_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
 
-        # decoder pass — reverse through same unique blocks, consume skips
         for i in range(self.num_unique_layers - 1, -1, -1):
             x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        bsz, seqlen, dim = x.shape
+        x = self.final_norm(x)
+
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x.reshape(-1, dim), self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
+            logits_proj = self.lm_head(x.reshape(-1, dim))
+
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+        if target_ids is None:
+            return logits.reshape(bsz, seqlen, -1)  # [batch, seq, vocab] for sliding window
+
+        targets = target_ids.reshape(-1)  # only runs when target_ids is NOT None
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 # -----------------------------
@@ -910,6 +934,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.muon_weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
