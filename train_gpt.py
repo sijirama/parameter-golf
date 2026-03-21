@@ -60,7 +60,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
-    model_dim = int(os.environ.get("MODEL_DIM", 768))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
