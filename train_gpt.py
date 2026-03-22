@@ -47,7 +47,7 @@ class Hyperparameters:
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 3000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -72,10 +72,10 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -89,6 +89,7 @@ class Hyperparameters:
     num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 6))
     num_recurrent_passes = int(os.environ.get("NUM_RECURRENT_PASSES", 2))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 256))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -231,8 +232,8 @@ def eval_val(
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
     window_size = args.train_seq_len        # 2048 — full window
-    stride = window_size // 2              # 1024 — step size
-    context_len = stride                   # first half = warmup only
+    stride = args.eval_stride
+    context_len = window_size - stride   
 
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
