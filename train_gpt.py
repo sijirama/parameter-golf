@@ -60,7 +60,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 576))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -86,7 +86,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     # new 
-    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 4))
+    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 6))
     num_recurrent_passes = int(os.environ.get("NUM_RECURRENT_PASSES", 2))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
 
